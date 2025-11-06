@@ -128,6 +128,7 @@ Average attempts/job: 1.4
 
 ## Project Structure
 
+```
 queuectl/
 ├── queuectl/
 │   ├── __init__.py
@@ -141,7 +142,7 @@ queuectl/
 │   └── test_basic.py    # Basic smoke tests
 ├── requirements.txt
 └── README.md
-
+```
 ---
 
 ## Demo Script
