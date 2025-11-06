@@ -1,5 +1,5 @@
 import os, subprocess, time, signal
-from .util import connect, reserve_job, mark_done, schedule_retry_or_dlq, get_config
+from .util import connect, reserve_job, mark_done, schedule_retry_or_dlq, get_config, LOG_DIR
 
 _stop = False
 def _sigterm(signum, frame):
@@ -22,19 +22,33 @@ def run_worker():
             time.sleep(0.5)
             continue
 
+        jid = job["id"]
         cmd = job["command"]
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"{jid}.log")
+
         try:
-            proc = subprocess.run(cmd, shell=True, timeout=timeout)
+            with open(log_path, "w") as lf:
+                proc = subprocess.run(
+                    cmd, shell=True, timeout=timeout,
+                    stdout=lf, stderr=subprocess.STDOUT
+                )
             ok = proc.returncode == 0
-            mark_done(conn, job["id"], ok, None if ok else f"exit {proc.returncode}", proc.returncode)
+            mark_done(conn, jid, ok, None if ok else f"exit {proc.returncode}", proc.returncode)
             if not ok:
                 schedule_retry_or_dlq(conn, job, base)
         except subprocess.TimeoutExpired:
-            mark_done(conn, job["id"], False, "timeout", 124)
+            with open(log_path, "a") as lf:
+                lf.write("\n[ERROR] Job timed out.\n")
+            mark_done(conn, jid, False, "timeout", 124)
             schedule_retry_or_dlq(conn, job, base)
         except FileNotFoundError as e:
-            mark_done(conn, job["id"], False, str(e), 127)
+            with open(log_path, "a") as lf:
+                lf.write(f"\n[ERROR] {e}\n")
+            mark_done(conn, jid, False, str(e), 127)
             schedule_retry_or_dlq(conn, job, base)
         except Exception as e:
-            mark_done(conn, job["id"], False, str(e), 1)
+            with open(log_path, "a") as lf:
+                lf.write(f"\n[EXCEPTION] {e}\n")
+            mark_done(conn, jid, False, str(e), 1)
             schedule_retry_or_dlq(conn, job, base)

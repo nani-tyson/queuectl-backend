@@ -1,21 +1,23 @@
-import os, sqlite3, json, time, signal, contextlib, uuid
+import os, sqlite3, json, time, signal, contextlib, uuid, datetime
 from typing import Optional, Dict, Any, List
 
 DEFAULT_DIR = os.path.join(os.getcwd(), ".queuectl")
 DEFAULT_DB = os.path.join(DEFAULT_DIR, "queue.db")
 PID_FILE = os.path.join(DEFAULT_DIR, "pids.json")
+LOG_DIR = os.path.join(DEFAULT_DIR, "logs")
 
-SCHEMA = """
+SCHEMA_BASE = '''
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS jobs(
   id TEXT PRIMARY KEY,
   command TEXT NOT NULL,
-  state TEXT NOT NULL,                  -- pending|processing|completed|dead
+  state TEXT NOT NULL,                  -- pending|processing|completed|dead|failed
   attempts INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 3,
+  priority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  run_at REAL NOT NULL,                 -- epoch seconds when eligible
+  run_at REAL NOT NULL,
   worker_id TEXT,
   last_error TEXT,
   last_exit_code INTEGER
@@ -26,7 +28,7 @@ CREATE TABLE IF NOT EXISTS config(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-"""
+'''
 
 DEFAULT_CONFIG = {
     "max_retries": "3",
@@ -34,116 +36,124 @@ DEFAULT_CONFIG = {
     "timeout_seconds": "0",
 }
 
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
-
 def ensure_dirs():
     os.makedirs(DEFAULT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
 
 def connect() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DEFAULT_DB, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     with conn:
-        for stmt in SCHEMA.strip().split(";"):
+        for stmt in SCHEMA_BASE.strip().split(';'):
             s = stmt.strip()
             if s:
-                conn.execute(s + ";")
+                conn.execute(s + ';')
         for k, v in DEFAULT_CONFIG.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO config(key,value) VALUES(?,?)", (k, v)
-            )
+            conn.execute('INSERT OR IGNORE INTO config(key,value) VALUES(?,?)', (k, v))
+    _ensure_column(conn, 'jobs', 'priority', 'INTEGER NOT NULL DEFAULT 0')
+    _ensure_column(conn, 'jobs', 'run_at', "REAL NOT NULL DEFAULT (strftime('%s','now'))")
     return conn
+
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str):
+    cols = [r['name'] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+    if col not in cols:
+        with conn:
+            conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} {decl}')
+
+def _iso_now() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time()))
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection):
-    conn.execute("BEGIN IMMEDIATE;")
+    conn.execute('BEGIN IMMEDIATE;')
     try:
         yield
-        conn.execute("COMMIT;")
+        conn.execute('COMMIT;')
     except:
-        conn.execute("ROLLBACK;")
+        conn.execute('ROLLBACK;')
         raise
 
-# ---------------------------- Jobs / Queue ----------------------------
-
 def insert_job(conn: sqlite3.Connection, payload: Dict[str, Any]) -> str:
-    jid = payload.get("id") or str(uuid.uuid4())
-    if "command" not in payload or not str(payload["command"]).strip():
-        raise ValueError("Job payload must include non-empty 'command'")
-    cmd = payload["command"]
-    now_epoch = time.time()
-    t = _iso_now()
-    mr = int(payload.get("max_retries") or DEFAULT_CONFIG["max_retries"])
+    jid = payload.get('id') or str(uuid.uuid4())
+    cmd = payload.get('command')
+    if not cmd or not str(cmd).strip():
+        raise ValueError("Job must include non-empty 'command'")
+    mr = int(payload.get('max_retries') or get_config(conn).get('max_retries', '3'))
+    priority = int(payload.get('priority', 0))
+    run_at_val = payload.get('run_at')
+    if run_at_val:
+        try:
+            ts = datetime.datetime.fromisoformat(run_at_val.replace('Z','')).timestamp()
+        except Exception:
+            raise ValueError('Invalid run_at format; use ISO8601 like 2025-11-08T12:00:00Z')
+    else:
+        ts = time.time()
+    now_iso = _iso_now()
     with tx(conn):
         conn.execute(
-            """
-            INSERT INTO jobs(id, command, state, attempts, max_retries, created_at, updated_at, run_at, worker_id, last_error, last_exit_code)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (jid, cmd, "pending", 0, mr, t, t, now_epoch, None, None, None),
+            """INSERT INTO jobs(id,command,state,attempts,max_retries,priority,created_at,updated_at,run_at,worker_id,last_error,last_exit_code)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (jid, cmd, 'pending', 0, mr, priority, now_iso, now_iso, ts, None, None, None),
         )
     return jid
 
-def list_jobs(conn: sqlite3.Connection, state: Optional[str] = None) -> List[sqlite3.Row]:
+def list_jobs(conn: sqlite3.Connection, state: Optional[str] = None):
     if state:
         return conn.execute(
-            "SELECT * FROM jobs WHERE state=? ORDER BY run_at ASC, created_at ASC", (state,)
+            'SELECT * FROM jobs WHERE state=? ORDER BY priority DESC, run_at ASC, created_at ASC',
+            (state,)
         ).fetchall()
     return conn.execute(
-        "SELECT * FROM jobs ORDER BY run_at ASC, created_at ASC"
+        'SELECT * FROM jobs ORDER BY priority DESC, run_at ASC, created_at ASC'
     ).fetchall()
 
-def counts(conn: sqlite3.Connection) -> Dict[str, int]:
+def counts(conn: sqlite3.Connection):
     out = {}
-    for s in ["pending", "processing", "completed", "dead"]:
-        out[s] = conn.execute(
-            "SELECT COUNT(1) AS c FROM jobs WHERE state=?", (s,)
-        ).fetchone()["c"]
+    for s in ['pending', 'processing', 'completed', 'dead']:
+        out[s] = conn.execute('SELECT COUNT(1) AS c FROM jobs WHERE state=?', (s,)).fetchone()['c']
     return out
 
-def get_config(conn: sqlite3.Connection) -> Dict[str, str]:
-    return {r["key"]: r["value"] for r in conn.execute("SELECT key,value FROM config")}
+def get_config(conn: sqlite3.Connection):
+    return {r['key']: r['value'] for r in conn.execute('SELECT key,value FROM config')}
 
 def set_config(conn: sqlite3.Connection, key: str, value: str):
     with tx(conn):
         conn.execute(
-            "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
+            'INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+            (key, value)
         )
 
 def reserve_job(conn: sqlite3.Connection, wid: str):
-    """Atomically move one eligible job to processing and return it."""
     now_epoch = time.time()
     with tx(conn):
         row = conn.execute(
-            "SELECT id FROM jobs WHERE state='pending' AND run_at<=? ORDER BY run_at ASC, created_at ASC LIMIT 1",
-            (now_epoch,),
+            "SELECT id FROM jobs WHERE state='pending' AND run_at<=? ORDER BY priority DESC, run_at ASC, created_at ASC LIMIT 1",
+            (now_epoch,)
         ).fetchone()
         if not row:
             return None
-        jid = row["id"]
-        # Guard against races
+        jid = row['id']
         updated = conn.execute(
             "UPDATE jobs SET state='processing', worker_id=?, updated_at=? WHERE id=? AND state='pending'",
-            (wid, _iso_now(), jid),
+            (wid, _iso_now(), jid)
         )
         if updated.rowcount != 1:
             return None
-    return conn.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    return conn.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
 
-def mark_done(conn: sqlite3.Connection, job_id: str, success: bool, err: str | None, code: int):
+def mark_done(conn: sqlite3.Connection, job_id: str, success: bool, err: Optional[str], code: int):
     t = _iso_now()
-    state = "completed" if success else "failed"
+    state = 'completed' if success else 'failed'
     with tx(conn):
         conn.execute(
-            "UPDATE jobs SET state=?, last_error=?, last_exit_code=?, updated_at=?, worker_id=NULL WHERE id=?",
-            (state, err, code, t, job_id),
+            'UPDATE jobs SET state=?, last_error=?, last_exit_code=?, updated_at=?, worker_id=NULL WHERE id=?',
+            (state, err, code, t, job_id)
         )
 
-def schedule_retry_or_dlq(conn: sqlite3.Connection, job: sqlite3.Row, base: int):
-    attempts = job["attempts"] + 1
-    max_retries = job["max_retries"]
+def schedule_retry_or_dlq(conn: sqlite3.Connection, job, base: int):
+    attempts = job['attempts'] + 1
+    max_retries = job['max_retries']
     delay = base ** attempts
     due = time.time() + delay
     t = _iso_now()
@@ -151,31 +161,29 @@ def schedule_retry_or_dlq(conn: sqlite3.Connection, job: sqlite3.Row, base: int)
         if attempts > max_retries:
             conn.execute(
                 "UPDATE jobs SET state='dead', attempts=?, updated_at=?, worker_id=NULL WHERE id=?",
-                (attempts, t, job["id"]),
+                (attempts, t, job['id'])
             )
         else:
             conn.execute(
                 "UPDATE jobs SET state='pending', attempts=?, run_at=?, updated_at=?, worker_id=NULL WHERE id=?",
-                (attempts, due, t, job["id"]),
+                (attempts, due, t, job['id'])
             )
 
-# ---------------------------- Worker PIDs ----------------------------
-
-def pids_load() -> Dict[str, Any]:
+def pids_load():
     ensure_dirs()
     if not os.path.exists(PID_FILE):
-        return {"workers": []}
+        return {'workers': []}
     try:
-        return json.load(open(PID_FILE, "r"))
+        return json.load(open(PID_FILE, 'r'))
     except Exception:
-        return {"workers": []}
+        return {'workers': []}
 
-def pids_save(data: Dict[str, Any]):
+def pids_save(data):
     ensure_dirs()
-    with open(PID_FILE, "w") as f:
+    with open(PID_FILE, 'w') as f:
         json.dump(data, f, indent=2)
 
-def kill_pids(pids: List[int]):
+def kill_pids(pids):
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)

@@ -7,7 +7,6 @@ from .util import (
     get_config, set_config,
     pids_load, pids_save, kill_pids, pid_alive,
 )
-from .worker import run_worker
 
 app = typer.Typer(help="QueueCTL — Background job queue CLI.", add_completion=False)
 
@@ -17,8 +16,9 @@ app = typer.Typer(help="QueueCTL — Background job queue CLI.", add_completion=
 def enqueue(job_json: str):
     """
     Add a new job.
-    Example:
+    Examples:
       queuectl enqueue '{"id":"job1","command":"sleep 2"}'
+      queuectl enqueue '{"command":"echo hi","priority":5,"run_at":"2025-11-08T12:00:00Z"}'
     """
     conn = connect()
     try:
@@ -33,7 +33,7 @@ def enqueue(job_json: str):
         raise typer.Exit(1)
     print(f"[green]Enqueued[/green] id=[bold]{jid}[/bold]")
 
-# ---------------- Workers ----------------
+# ---------------- Worker Management ----------------
 
 worker = typer.Typer(help="Worker management")
 app.add_typer(worker, name="worker")
@@ -42,7 +42,6 @@ app.add_typer(worker, name="worker")
 def worker_start(count: int = typer.Option(1, "--count", min=1, help="Number of workers to start")):
     """Start one or more workers (background)."""
     p = pids_load()
-    # keep only live
     p["workers"] = [pid for pid in p.get("workers", []) if pid_alive(pid)]
     spawned = []
     for _ in range(count):
@@ -90,7 +89,7 @@ def status():
     if live:
         print(", ".join(map(str, live)))
 
-# ---------------- List Jobs ----------------
+# ---------------- List ----------------
 
 @app.command("list")
 def list_command(state: Optional[str] = typer.Option(None, "--state", help="Filter by job state")):
@@ -102,10 +101,13 @@ def list_command(state: Optional[str] = typer.Option(None, "--state", help="Filt
     table.add_column("state")
     table.add_column("cmd")
     table.add_column("attempts", justify="right")
+    table.add_column("priority", justify="right")
     table.add_column("run_at", justify="right")
     for r in rows:
-        table.add_row(r["id"], r["state"], r["command"], str(r["attempts"]),
-                      time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["run_at"])))
+        table.add_row(
+            r["id"], r["state"], r["command"], str(r["attempts"]), str(r["priority"]),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["run_at"]))
+        )
     print(table)
 
 # ---------------- DLQ ----------------
@@ -164,3 +166,22 @@ def config_set(key: str, value: str):
     conn = connect()
     set_config(conn, key, value)
     print(f"[green]Set[/green] {key} = {value}")
+
+# ---------------- Metrics ----------------
+
+@app.command("metrics")
+def metrics():
+    """Show job metrics and success/failure rates."""
+    conn = connect()
+    total = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"]
+    if total == 0:
+        print("[yellow]No jobs yet.[/yellow]")
+        return
+    completed = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE state='completed'").fetchone()["c"]
+    dead = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE state='dead'").fetchone()["c"]
+    avg_attempts = conn.execute("SELECT AVG(attempts) AS a FROM jobs").fetchone()["a"] or 0.0
+    print(f"📊 Total jobs: {total}")
+    print(f"✅ Completed: {completed}")
+    print(f"💀 Dead: {dead}")
+    print(f"📈 Success rate: {completed/total*100:.1f}%")
+    print(f"⚡ Avg attempts/job: {avg_attempts:.2f}")
