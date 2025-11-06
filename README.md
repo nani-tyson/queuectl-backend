@@ -1,4 +1,4 @@
-```markdown
+```
 # QueueCTL — CLI Job Queue (Python + SQLite)
 
 A CLI-based background job queue with workers, exponential backoff retries, and a Dead Letter Queue (DLQ).  
@@ -103,24 +103,5 @@ This will:
 - **Database:** SQLite (WAL mode enabled)  
 - **Concurrency:** Multiprocessing (via subprocess workers)  
 - **Persistence:** Automatic with `.queuectl/queue.db`  
-
----
-
-## 🧾 Next Steps
-
-- [ ] Add optional bonus features:
-  - Job output logging
-  - Scheduled jobs (`run_at`)
-  - Job priority queues
-  - Metrics or stats endpoint
-- [ ] Create `design.md` (architecture & flow)
-- [ ] Record CLI demo video for submission
-
----
-
-**Author:** [Your Name]  
-**License:** MIT  
-**Repository:** https://github.com/<your-username>/queuectl
-```
 
 ---
